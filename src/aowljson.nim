@@ -46,11 +46,14 @@ proc newJObject*(): JsonValue = JsonValue(kind: jnObject, fields: @[])
 # ---------------------------------------------------------------------------
 
 proc add*(arr: JsonValue; v: JsonValue) =
-  ## Append to an array node.
+  ## Append to an array node. A no-op on nil or a non-array, so that building a
+  ## tree out of values some of which came back absent cannot fault.
+  if arr == nil or arr.kind != jnArray: return
   arr.elems.add(v)
 
 proc `[]=`*(obj: JsonValue; key: string; v: JsonValue) =
   ## Set (or replace) an object member, preserving first-seen order.
+  if obj == nil or obj.kind != jnObject: return
   for i in 0 ..< obj.fields.len:
     if obj.fields[i][0] == key:
       obj.fields[i] = (key, v)
@@ -61,54 +64,83 @@ proc `[]=`*(obj: JsonValue; key: string; v: JsonValue) =
 # access
 # ---------------------------------------------------------------------------
 
+## ABSENT IS nil, AND EVERY ACCESSOR TOLERATES nil.
+##
+## `{}` used to return a fresh JNull for a missing key, so that chains like
+## `req{"params"}{"name"}` could never fault. Chain safety is the right goal and
+## is preserved below — but paying for it in the RETURN VALUE made `!= nil`, the
+## one presence test everybody reaches for, always true and therefore dead code
+## that reads as a guard.
+##
+## That is a silent-wrong-answer API, and it cost a real bug: a Telegram bridge
+## distinguished a button tap from a chat message with
+## `u{"callback_query"} != nil`, took the button branch on every ordinary
+## message, and answered nothing at all — while still advancing its update
+## offset, so it looked exactly like a quiet chat.
+##
+## So absence is now nil (as in `std/json`, which matters because porting Nim
+## code is the point of Nimony), and chain safety is paid for HERE instead: every
+## accessor below returns the same thing for nil that it returns for a
+## type mismatch. `nil{"a"}{"b"}.getStr("x")` is still "x", and `if x != nil`
+## now means what it says.
+
 proc len*(n: JsonValue): int =
-  ## Element count for arrays and objects; 0 otherwise.
+  ## Element count for arrays and objects; 0 otherwise (including nil).
+  if n == nil: return 0
   case n.kind
   of jnArray: n.elems.len
   of jnObject: n.fields.len
   else: 0
 
 proc hasKey*(n: JsonValue; key: string): bool =
-  if n.kind != jnObject: return false
+  if n == nil or n.kind != jnObject: return false
   for f in n.fields:
     if f[0] == key: return true
   return false
 
 proc `{}`*(n: JsonValue; key: string): JsonValue =
-  ## Object member lookup. Returns a fresh JNull when `n` is not an object or
-  ## the key is absent, so chains like `req{"params"}{"name"}` never fault.
-  if n.kind == jnObject:
+  ## Object member lookup, or **nil** when `n` is nil, is not an object, or the
+  ## key is absent. Chains do not fault because every accessor here takes nil.
+  if n != nil and n.kind == jnObject:
     for f in n.fields:
       if f[0] == key: return f[1]
-  return newJNull()
+  return nil
 
 proc at*(n: JsonValue; i: int): JsonValue =
-  ## Array index; JNull when out of range or not an array.
-  if n.kind == jnArray and i >= 0 and i < n.elems.len:
+  ## Array index, or nil when out of range, not an array, or nil.
+  if n != nil and n.kind == jnArray and i >= 0 and i < n.elems.len:
     return n.elems[i]
-  return newJNull()
+  return nil
 
 proc getStr*(n: JsonValue; default = ""): string =
-  if n.kind == jnString: n.sval else: default
+  if n != nil and n.kind == jnString: n.sval else: default
 
 proc getInt*(n: JsonValue; default: int64 = 0): int64 =
-  if n.kind != jnNumber: return default
+  if n == nil or n.kind != jnNumber: return default
   try:
     return int64(parseInt(n.num))
   except:
     return default
 
 proc getBool*(n: JsonValue; default = false): bool =
-  if n.kind == jnBool: n.bval else: default
+  if n != nil and n.kind == jnBool: n.bval else: default
 
-proc isNull*(n: JsonValue): bool = n.kind == jnNull
+proc isNull*(n: JsonValue): bool =
+  ## True for an explicit JSON `null` AND for nil — "there is no value here"
+  ## reads the same either way, which is what every caller of this actually
+  ## wants. Use `== nil` when you need to tell absent from a literal null.
+  n == nil or n.kind == jnNull
+
+proc kindOf*(n: JsonValue): JsonKind =
+  ## `n.kind` faults on nil; this does not. Absent reads as jnNull.
+  if n == nil: jnNull else: n.kind
 
 iterator items*(n: JsonValue): JsonValue =
-  if n.kind == jnArray:
+  if n != nil and n.kind == jnArray:
     for e in n.elems: yield e
 
 iterator pairs*(n: JsonValue): (string, JsonValue) =
-  if n.kind == jnObject:
+  if n != nil and n.kind == jnObject:
     for f in n.fields: yield f
 
 # ---------------------------------------------------------------------------
@@ -138,6 +170,11 @@ proc escapeInto(s: string; dst: var string) =
   dst.add('"')
 
 proc toStringInto(n: JsonValue; dst: var string) =
+  # A nil child is a hole in the tree, not a crash while serialising. It can
+  # only get there by being put there deliberately, and `null` is what it means.
+  if n == nil:
+    dst.add("null")
+    return
   case n.kind
   of jnNull: dst.add("null")
   of jnBool: dst.add(if n.bval: "true" else: "false")
