@@ -53,11 +53,28 @@ proc add*(arr: JsonValue; v: JsonValue) =
 
 proc `[]=`*(obj: JsonValue; key: string; v: JsonValue) =
   ## Set (or replace) an object member, preserving first-seen order.
+  ##
+  ## The scan is what makes this a SET rather than an append, and it is the
+  ## right default for building a value by hand. It is the wrong tool for a
+  ## parser: replacing makes the cost quadratic in the number of keys, and it
+  ## silently collapses `{"a":1,"a":2}` into one pair — a document the reader
+  ## was asked to represent, not to fix. Parsers want `addPair` below.
   if obj == nil or obj.kind != jnObject: return
   for i in 0 ..< obj.fields.len:
     if obj.fields[i][0] == key:
       obj.fields[i] = (key, v)
       return
+  obj.fields.add((key, v))
+
+proc addPair*(obj: JsonValue; key: string; v: JsonValue) =
+  ## Append a member WITHOUT looking for an existing one: O(1), and duplicate
+  ## keys are kept exactly as the document spelled them.
+  ##
+  ## This is what a parser needs. `[]=` rescans every key already present, so
+  ## reading an object of n members costs O(n²) — measurable on the real thing:
+  ## a 10MB document with wide objects spent more time rescanning key lists than
+  ## it did parsing. It also drops duplicates, which a faithful reader may not do.
+  if obj == nil or obj.kind != jnObject: return
   obj.fields.add((key, v))
 
 # ---------------------------------------------------------------------------
